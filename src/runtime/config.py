@@ -1,5 +1,23 @@
 import os
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
 
@@ -110,6 +128,7 @@ def resolve_model_providers() -> list[dict]:
 
 # Legacy compatibility shims (kept so other modules importing these don't break)
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # QQ SMTP
@@ -163,6 +182,13 @@ OCR_MAX_TARGET = int(os.environ.get("OCR_MAX_TARGET", "2"))
 VIDEO_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("VIDEO_DOWNLOAD_CONCURRENCY", "2")
 )
+
+# Workflow continuation.  MAX_RUN_MINUTES <= 0 disables the graceful stop.
+MAX_RUN_MINUTES = _env_int("MAX_RUN_MINUTES", 320)
+AUTO_CONTINUE = _env_bool("AUTO_CONTINUE", True)
+MAX_CONTINUE_RUNS = _env_int("MAX_CONTINUE_RUNS", 20)
+CONTINUE_COUNT = _env_int("CONTINUE_COUNT", 0)
+SEND_EMAIL_EACH_BATCH = _env_bool("SEND_EMAIL_EACH_BATCH", True)
 
 # 监控的课程 ID 列表
 COURSE_IDS = [

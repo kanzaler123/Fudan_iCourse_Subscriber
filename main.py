@@ -24,6 +24,7 @@ from src.api.emailer import Emailer
 from src.api.icourse import ICourseClient
 from src.pipeline.lecture_runner import LectureRunner
 from src.runtime.reporter import Reporter
+from src.runtime.run_budget import RunBudget, write_github_outputs
 from src.runtime.scheduler import Scheduler
 from src.ai.summarizer import Summarizer
 from src.ai.transcriber import Transcriber
@@ -139,15 +140,25 @@ def _drive_lectures(client: ICourseClient, db: Database,
                     scheduler: Scheduler, transcriber: Transcriber,
                     summarizer: Summarizer, reporter: Reporter,
                     all_lectures: list[tuple[str, str, dict]],
-                    email_items: list) -> None:
+                    email_items: list,
+                    budget: RunBudget) -> tuple[int, bool]:
     """Phase 2: run each lecture through LectureRunner.
 
     Pre-schedules the first lecture's prefetch (audio + images) before
     entering the loop; subsequent prefetches are kicked off from inside
     each LectureRunner.run via ``next_info``.
+
+    Returns ``(attempted_count, stopped_for_budget)``.
     """
     if not all_lectures:
-        return
+        return 0, False
+
+    if budget.exhausted():
+        reporter.info(
+            "[Budget] Run budget already exhausted before lecture "
+            "processing; saving state and requesting continuation."
+        )
+        return 0, True
 
     first_course, _, first_lec = all_lectures[0]
     scheduler.prefetch_lecture(client, first_course, str(first_lec["sub_id"]))
@@ -156,7 +167,17 @@ def _drive_lectures(client: ICourseClient, db: Database,
         client, db, scheduler, transcriber, summarizer, reporter,
     )
 
+    attempted_count = 0
+    stopped_for_budget = False
     for i, (course_id, course_title, lecture) in enumerate(all_lectures):
+        if budget.exhausted():
+            stopped_for_budget = True
+            reporter.info(
+                "[Budget] Run budget exhausted before starting the next "
+                f"lecture ({attempted_count}/{len(all_lectures)} attempted)."
+            )
+            break
+
         sub_id = str(lecture["sub_id"])
         next_info: tuple[str, str] | None = None
         if i + 1 < len(all_lectures):
@@ -180,11 +201,23 @@ def _drive_lectures(client: ICourseClient, db: Database,
             reporter.lecture_error(sub_id)
             traceback.print_exc()
         finally:
+            attempted_count = i + 1
             # Belt-and-braces: drop any lingering prefetch entry for this
             # lecture so we don't leak bytes if the runner crashed before
             # PPTPipeline.submit released the cache.
             scheduler.image_cache.discard(sub_id)
             scheduler.audio_downloader.release(sub_id)
+
+        if budget.exhausted() and attempted_count < len(all_lectures):
+            stopped_for_budget = True
+            reporter.info(
+                "[Budget] Run budget exhausted after this lecture; stopping "
+                f"before the next one ({attempted_count}/"
+                f"{len(all_lectures)} attempted)."
+            )
+            break
+
+    return attempted_count, stopped_for_budget
 
 
 def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
@@ -270,6 +303,7 @@ def run():
     """Single execution of the full pipeline."""
     reporter = Reporter()
     reporter.run_header()
+    budget = RunBudget.from_config(config)
 
     if not config.COURSE_IDS and not config.CRAWL_TERM:
         reporter.info(
@@ -304,22 +338,56 @@ def run():
     if not config.COURSE_IDS:
         # Crawl-only mode: nothing to process, just persist + exit.
         reporter.info("\n[Crawl-only mode] No COURSE_IDS — skipping lectures.")
+        status = budget.build_status(
+            total_count=0,
+            attempted_count=0,
+            stopped_for_budget=False,
+        )
+        write_github_outputs(status, course_ids=config.COURSE_IDS)
         reporter.run_footer()
         return
 
     scheduler = Scheduler(reporter=reporter)
+    all_lectures: list[tuple[str, str, dict]] = []
+    attempted_count = 0
+    stopped_for_budget = False
 
     try:
         all_lectures = _enumerate_lectures(client, db, reporter)
-        _drive_lectures(
+        attempted_count, stopped_for_budget = _drive_lectures(
             client, db, scheduler, transcriber, summarizer, reporter,
-            all_lectures, email_items,
+            all_lectures, email_items, budget,
         )
 
     finally:
         scheduler.shutdown()
 
-    _send_email(emailer, db, reporter, email_items)
+    status = budget.build_status(
+        total_count=len(all_lectures),
+        attempted_count=attempted_count,
+        stopped_for_budget=stopped_for_budget,
+    )
+    reporter.info(
+        "[Continuation] attempted="
+        f"{status.attempted_count}, remaining={status.remaining_count}, "
+        f"continue_needed={status.continue_needed}, "
+        f"continue_count={status.continue_count}/"
+        f"{status.max_continue_runs}"
+    )
+    if status.continue_blocked:
+        reporter.info(
+            "[Continuation] Auto-continue blocked: "
+            "MAX_CONTINUE_RUNS reached."
+        )
+    write_github_outputs(status, course_ids=config.COURSE_IDS)
+
+    if status.continue_needed and not config.SEND_EMAIL_EACH_BATCH:
+        reporter.info(
+            "[Email] SEND_EMAIL_EACH_BATCH=false; deferring email until "
+            "the backlog is drained."
+        )
+    else:
+        _send_email(emailer, db, reporter, email_items)
     reporter.run_footer()
 
 

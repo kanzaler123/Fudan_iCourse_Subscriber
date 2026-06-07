@@ -78,6 +78,19 @@
 
 首次运行会处理所有已有录播，后续只处理新增课次。
 
+### 自动续跑大批量录播
+
+首次运行如果历史录播很多，单次 GitHub Actions 可能接近 6 小时上限。项目默认启用自动续跑：每轮在接近 `MAX_RUN_MINUTES` 时主动保存进度并触发下一轮，直到待处理课次清空。
+
+可在 **Settings → Secrets and variables → Actions → Variables** 中调整：
+
+| Variable 名称 | 默认值 | 说明 |
+|---|---:|---|
+| `MAX_RUN_MINUTES` | `320` | 每轮主动收尾的时间预算，预留时间给数据库加密和推送 |
+| `AUTO_CONTINUE` | `true` | 是否在仍有剩余课次时自动触发下一轮 |
+| `MAX_CONTINUE_RUNS` | `20` | 最多自动续跑轮数，防止异常无限循环 |
+| `SEND_EMAIL_EACH_BATCH` | `true` | 每轮完成后是否立即发送本轮邮件；设为 `false` 时会等最后一轮汇总发送 |
+
 ## 前端页面（索引与查看）
 
 ![alt text](docs/frontend.png)
