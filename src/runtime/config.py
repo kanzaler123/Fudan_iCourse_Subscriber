@@ -26,6 +26,14 @@ USER_AGENT = (
 # 现的那条；这避免 Summarizer 内部按 name 索引 client 字典时被后写覆盖。
 MODEL_PROVIDERS: list[dict] = [
     {
+        "name": "quanthatch",
+        "api_key_env": "QUANTHATCH_API_KEY",
+        "base_url_env": "QUANTHATCH_BASE_URL",
+        "default_base_url": "https://free.quanthatch.com/v1",
+        "api_format": "anthropic",
+        "models": ["gpt-5.5"],
+    },
+    {
         "name": "modelscope",
         "api_key_env": "DASHSCOPE_API_KEY",
         "base_url_env": "DASHSCOPE_BASE_URL",
@@ -99,6 +107,7 @@ def resolve_model_providers() -> list[dict]:
             continue
         entry = {
             "name": p["name"],
+            "api_format": p.get("api_format", "openai"),
             "api_key": api_key,
             "base_url": base_url,
             "models": list(p["models"]),

@@ -2,6 +2,7 @@
 
 import time
 
+import requests
 from openai import OpenAI
 
 from src.runtime import config
@@ -130,6 +131,39 @@ class Summarizer:
             )
         return result
 
+    def _call_anthropic(self, provider: dict, model: str,
+                        title: str, content: str) -> str:
+        response = requests.post(
+            provider["base_url"].rstrip("/") + "/messages",
+            headers={
+                "Authorization": f"Bearer {provider['api_key']}",
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": model,
+                "max_tokens": 16384,
+                "system": SYSTEM_PROMPT,
+                "messages": [{
+                    "role": "user",
+                    "content": f"以下是课程《{title}》的录音文本，根据长度，你应该输出的字符数大约为{len(content) // 7}字，请开始总结：\n\n{content}",
+                }],
+            },
+            timeout=180,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("stop_reason") == "max_tokens":
+            raise ValueError("API response exceeded max_tokens")
+        result = "\n".join(
+            block["text"] for block in data.get("content", [])
+            if block.get("type") == "text"
+        )
+        if not result.strip():
+            raise ValueError("API returned empty content")
+        print(f"[Summarizer] Done ({model}): {len(content)} chars input"
+              f" → {len(result)} chars output")
+        return result
+
     def summarize(self, title: str, content: str) -> tuple[str, str]:
         """Summarize lecture, trying providers in MODEL_PROVIDERS order.
 
@@ -147,7 +181,10 @@ class Summarizer:
             for model in provider["models"]:
                 model_id = f"{provider['name']}/{model}"
                 try:
-                    result = self._call_llm(client, model, title, content)
+                    if provider.get("api_format") == "anthropic":
+                        result = self._call_anthropic(provider, model, title, content)
+                    else:
+                        result = self._call_llm(client, model, title, content)
                     return (result, model_id)
                 except Exception as e:
                     print(f"[Summarizer] {model_id} failed: "
