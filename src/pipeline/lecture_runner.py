@@ -38,7 +38,7 @@ threads pick up refreshed cookies through the shared ``ICourseClient``.
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from src.ai import bucketer
 from src.pipeline.ppt_pipeline import PPTPipeline
@@ -60,8 +60,13 @@ class LectureRunner:
 
     def __init__(self, client: "ICourseClient", db: "Database",
                  scheduler: "Scheduler", transcriber: "Transcriber",
-                 summarizer: "Summarizer", reporter: "Reporter"):
+                 summarizer: "Summarizer", reporter: "Reporter",
+                 ensure_session: Optional[Callable[[], None]] = None):
         self._client = client
+        # Re-login hook (main._check_session) used before resuming a
+        # truncated audio download — an expired WebVPN session is a common
+        # reason the stream died in the first place.
+        self._ensure_session = ensure_session
         self._db = db
         self._scheduler = scheduler
         self._transcriber = transcriber
@@ -320,6 +325,7 @@ class LectureRunner:
         try:
             transcript, segments = self._transcriber.transcribe_tail(
                 handle.path, handle.process, handle.stderr_chunks,
+                resume_fn=self._make_resume_fn(course_id, sub_id),
             )
         except NoAudioStreamError as e:
             self._reporter.info(f"    [SKIP] Video-only (no audio stream): {e}")
@@ -375,6 +381,26 @@ class LectureRunner:
             )
             self._db.update_error(sub_id, "summarize", str(e))
             raise
+
+    def _make_resume_fn(self, course_id: str, sub_id: str):
+        """Build the ``resume_fn`` Transcriber calls when a stream is cut."""
+        downloader = self._scheduler.audio_downloader
+
+        def resume(offset_sec: float):
+            if self._ensure_session is not None:
+                self._ensure_session()
+            self._reporter.info(
+                f"    [Resume] Audio stream cut at {offset_sec / 60:.1f} min; "
+                f"re-fetching video URL and continuing from there"
+            )
+            handle = downloader.resume(
+                self._client, course_id, sub_id, offset_sec,
+            )
+            if handle is None:
+                return None
+            return handle.path, handle.process, handle.stderr_chunks
+
+        return resume
 
     def _release_audio(self, sub_id: str):
         try:
