@@ -160,6 +160,7 @@ def _drive_lectures(client: ICourseClient, db: Database,
 
     runner = LectureRunner(
         client, db, scheduler, transcriber, summarizer, reporter,
+        ensure_session=lambda: _check_session(client),
     )
 
     first_course, _, first_lec = all_lectures[0]

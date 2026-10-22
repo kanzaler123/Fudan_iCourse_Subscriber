@@ -36,6 +36,12 @@ WINDOW_SIZE = 512  # VAD window in samples (~32 ms at 16 kHz)
 BYTES_PER_SAMPLE = 4  # float32
 BYTES_PER_SECOND = SAMPLE_RATE * BYTES_PER_SAMPLE
 SILENCE_GAP_THRESHOLD_SEC = 30 * 60  # 30 min of no speech → suspected cutoff
+# Truncated-stream recovery (see Transcriber.transcribe_tail).
+MAX_STREAM_RESUMES = 5   # resume attempts per lecture before giving up
+RESUME_SLACK_SEC = 10    # missing audio tolerated before resuming
+
+# resume_fn(offset_sec) -> (audio_path, ffmpeg_proc, stderr_chunks) | None
+ResumeFn = Callable[[float], Optional[tuple[str, subprocess.Popen, list]]]
 
 
 # ── Shared resource meter state (network delta tracking) ──────────────────
@@ -571,6 +577,8 @@ class Transcriber:
                         ffmpeg_proc: subprocess.Popen,
                         stderr_chunks: list[bytes],
                         timeout: int = 7200,
+                        resume_fn: Optional[ResumeFn] = None,
+                        max_resumes: int = MAX_STREAM_RESUMES,
                         ) -> tuple[str, list[dict]]:
         """Read PCM samples from a disk file that ffmpeg is *concurrently* writing.
 
@@ -580,6 +588,13 @@ class Transcriber:
                 know when "no more data ever".  Owned by the caller (Scheduler).
             stderr_chunks: List that the caller's stderr-drain thread appends to.
             timeout: Total seconds before giving up.
+            resume_fn(offset_sec): optional.  Called when ffmpeg exits with
+                audio clearly missing (stream cut part-way).  Must start a new
+                ffmpeg that seeks to ``offset_sec`` and return
+                ``(path, process, stderr_chunks)`` for it, or None to give up.
+                Reading continues from the new file, so the VAD state and
+                segment timestamps carry on seamlessly.
+            max_resumes: cap on resume attempts per lecture.
 
         Returns:
             ``(transcript, segments)``.
@@ -588,40 +603,91 @@ class Transcriber:
             RuntimeError if ffmpeg never wrote any audio.
             NoAudioStreamError if ffmpeg reported "does not contain any stream".
             IncompleteAudioError if <90 % of the media duration arrived
-                (e.g. ffmpeg exited cleanly on a truncated stream).
+                even after resuming (or ``resume_fn`` was not given).
             TimeoutError on overall ``timeout``.
         """
         # Wait for file to exist (ffmpeg may not have flushed the first byte yet)
-        t_wait = time.time()
-        while not os.path.exists(audio_path):
-            if ffmpeg_proc.poll() is not None:
-                stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-500:]
-                raise RuntimeError(
-                    f"ffmpeg exited (rc={ffmpeg_proc.returncode}) before "
-                    f"writing audio file {audio_path}.\nstderr:\n{stderr_text}"
-                )
-            if time.time() - t_wait > 60:
-                raise TimeoutError(
-                    f"ffmpeg did not create {audio_path} within 60 s"
-                )
-            time.sleep(0.1)
+        if not self._wait_for_audio_file(audio_path, ffmpeg_proc):
+            stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-500:]
+            raise RuntimeError(
+                f"ffmpeg exited (rc={ffmpeg_proc.returncode}) before "
+                f"writing audio file {audio_path}.\nstderr:\n{stderr_text}"
+            )
 
-        f = open(audio_path, "rb")
+        # Mutable "current source" — swapped when a resume succeeds.
+        src = {"f": open(audio_path, "rb"), "proc": ffmpeg_proc}
+        stderr_log: list[list[bytes]] = [stderr_chunks]
+        bytes_read = 0
+        resumes = 0
+
+        def all_stderr() -> bytes:
+            return b"".join(b"".join(chunks) for chunks in stderr_log)
+
+        def read_fn(n: int) -> bytes:
+            nonlocal bytes_read
+            data = src["f"].read(n)
+            bytes_read += len(data)
+            return data
+
+        def is_eof_fn() -> bool:
+            nonlocal resumes
+            if src["proc"].poll() is None:
+                return False
+            # ffmpeg exited — first drain whatever it wrote between our last
+            # (empty) read and its exit.
+            f = src["f"]
+            if f.tell() < os.fstat(f.fileno()).st_size:
+                return False
+            if resume_fn is None or not self._stream_was_cut(
+                    bytes_read, all_stderr(), src["proc"].returncode):
+                return True
+
+            while resumes < max_resumes:
+                resumes += 1
+                offset = bytes_read / BYTES_PER_SECOND
+                print(
+                    f"[Transcriber] Stream ended early at {offset:.0f}s "
+                    f"(rc={src['proc'].returncode}); resuming with a fresh "
+                    f"URL (attempt {resumes}/{max_resumes})...",
+                    flush=True,
+                )
+                time.sleep(min(5 * resumes, 30))
+                try:
+                    new = resume_fn(offset)
+                except Exception as e:
+                    print(f"[Transcriber] Resume failed: "
+                          f"{type(e).__name__}: {e}", flush=True)
+                    continue
+                if new is None:
+                    print("[Transcriber] Resume unavailable; giving up.",
+                          flush=True)
+                    return True
+                new_path, new_proc, new_chunks = new
+                stderr_log.append(new_chunks)
+                try:
+                    started = self._wait_for_audio_file(new_path, new_proc)
+                except TimeoutError:
+                    new_proc.kill()
+                    new_proc.wait()
+                    started = False
+                if not started:
+                    tail = b"".join(new_chunks).decode(errors="replace")[-300:]
+                    print(f"[Transcriber] Resumed ffmpeg exited before "
+                          f"writing (rc={new_proc.returncode}): {tail}",
+                          flush=True)
+                    continue
+                f.close()
+                src["f"] = open(new_path, "rb")
+                src["proc"] = new_proc
+                return False
+            return True
+
         try:
-            def read_fn(n: int) -> bytes:
-                return f.read(n)
-
-            def is_eof_fn() -> bool:
-                # Truly EOF iff ffmpeg has exited.  ``_consume_pcm_stream``
-                # will do one more read after we say EOF, but our open file
-                # handle already reflects all bytes ffmpeg wrote.
-                return ffmpeg_proc.poll() is not None
-
             transcript, segments = self._consume_pcm_stream(
                 read_fn=read_fn,
                 is_eof_fn=is_eof_fn,
-                stderr_provider=lambda: b"".join(stderr_chunks),
-                return_code_fn=lambda: ffmpeg_proc.returncode,
+                stderr_provider=all_stderr,
+                return_code_fn=lambda: src["proc"].returncode,
                 timeout=timeout,
                 wait_on_empty_sec=0.1,
                 label="tail",
@@ -630,9 +696,52 @@ class Transcriber:
             # this check the partial transcript would silently pass as a
             # complete lecture.
             self._check_completeness(transcript, segments)
+            if resumes:
+                print(f"[Transcriber] Completed after {resumes} resume(s).",
+                      flush=True)
             return transcript, segments
         finally:
-            f.close()
+            src["f"].close()
+
+    @staticmethod
+    def _wait_for_audio_file(path: str, proc: subprocess.Popen,
+                             timeout: float = 60.0) -> bool:
+        """Wait until ffmpeg has created ``path``.
+
+        Returns False if ffmpeg exited without creating it; raises
+        TimeoutError if it is still running but silent after ``timeout``.
+        """
+        t_wait = time.time()
+        while not os.path.exists(path):
+            if proc.poll() is not None:
+                return os.path.exists(path)
+            if time.time() - t_wait > timeout:
+                raise TimeoutError(
+                    f"ffmpeg did not create {path} within {timeout:.0f} s"
+                )
+            time.sleep(0.1)
+        return True
+
+    @staticmethod
+    def _stream_was_cut(bytes_read: int, stderr: bytes,
+                        rc: Optional[int]) -> bool:
+        """Did ffmpeg stop before the end of the media (so resuming helps)?"""
+        if bytes_read == 0:
+            return False          # never started — leave to normal errors
+        if rc in (-9, -15):
+            return False          # we killed it (release) — not a cut
+        if b"does not contain any stream" in stderr:
+            return False
+        received = bytes_read / BYTES_PER_SECOND
+        m = re.search(rb"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if m:
+            h, mi, s = m.groups()
+            total = int(h) * 3600 + int(mi) * 60 + float(s)
+            # A complete decode lands within a second or two of the
+            # container duration; allow generous slack before resuming.
+            return total - received > max(RESUME_SLACK_SEC, 0.02 * total)
+        # Unknown duration: only a non-zero exit signals a broken stream.
+        return rc not in (0, None)
 
     # ── Public mode 2 — legacy URL streaming (fallback) ─────────────────
 

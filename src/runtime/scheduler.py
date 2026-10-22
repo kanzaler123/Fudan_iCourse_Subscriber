@@ -131,6 +131,7 @@ class AudioHandle:
     path: str          # disk file ffmpeg writes f32le mono 16 kHz to
     process: subprocess.Popen
     stderr_chunks: list[bytes]
+    resumes: int = 0   # how many times resume() restarted this download
 
 
 class _PendingSpawn:
@@ -210,47 +211,10 @@ class AudioDownloader:
                     self._pop_if_mine(sub_id, pending)
                     self._sem.release()
                     return
-                vpn_url, headers = client.get_stream_params(url)
                 path = os.path.join(self._dir, f"{sub_id}.raw")
-                if os.path.exists(path):
-                    os.remove(path)
-
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-headers", headers,
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-i", vpn_url,
-                    "-vn",
-                    "-ar", "16000",
-                    "-ac", "1",
-                    "-f", "f32le",
-                    path,
-                ]
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                proc, stderr_chunks = self._spawn_ffmpeg(
+                    client, url, path, sub_id,
                 )
-
-                # Drain stderr so the pipe never deadlocks.  Keep last few KB
-                # for diagnostics if ffmpeg dies.
-                stderr_chunks: list[bytes] = []
-
-                def _drain():
-                    try:
-                        for chunk in proc.stderr:
-                            stderr_chunks.append(chunk)
-                            if len(stderr_chunks) > 2048:
-                                # keep only the tail to bound memory
-                                del stderr_chunks[: -1024]
-                    except Exception:
-                        pass
-
-                threading.Thread(
-                    target=_drain, name=f"audio-stderr-{sub_id}",
-                    daemon=True,
-                ).start()
 
                 handle = AudioHandle(
                     sub_id=sub_id, path=path,
@@ -288,7 +252,7 @@ class AudioDownloader:
                 # ffmpeg exits.  We do NOT pop from _active here — that's
                 # the caller's job (via release()).
                 threading.Thread(
-                    target=self._monitor, args=(handle,),
+                    target=self._monitor, args=(proc,),
                     name=f"audio-monitor-{sub_id}", daemon=True,
                 ).start()
             except Exception:
@@ -299,8 +263,125 @@ class AudioDownloader:
             if self._reporter:
                 self._reporter.audio_prefetch_failed(sub_id, e)
 
-    def _monitor(self, handle: AudioHandle):
-        handle.process.wait()
+    @staticmethod
+    def _spawn_ffmpeg(client, url: str, path: str, sub_id: str,
+                      seek_sec: float = 0.0,
+                      ) -> tuple[subprocess.Popen, list[bytes]]:
+        """Start ``ffmpeg <signed URL> → f32le mono 16 kHz`` writing ``path``.
+
+        ``seek_sec > 0`` adds an input-side ``-ss`` so a resumed download
+        starts where a truncated one stopped.  For MP4 over HTTP ffmpeg
+        turns that into a byte-range request via the moov index, so the
+        already-transcribed part is not downloaded again; audio decoding
+        after an input seek is sample-accurate.
+        """
+        vpn_url, headers = client.get_stream_params(url)
+        if os.path.exists(path):
+            os.remove(path)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-headers", headers,
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
+        ]
+        if seek_sec > 0:
+            cmd += ["-ss", f"{seek_sec:.3f}"]
+        cmd += [
+            "-i", vpn_url,
+            "-vn",
+            "-ar", "16000",
+            "-ac", "1",
+            "-f", "f32le",
+            path,
+        ]
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+        # Drain stderr so the pipe never deadlocks.  Keep last few KB
+        # for diagnostics if ffmpeg dies.
+        stderr_chunks: list[bytes] = []
+
+        def _drain():
+            try:
+                for chunk in proc.stderr:
+                    stderr_chunks.append(chunk)
+                    if len(stderr_chunks) > 2048:
+                        # keep only the tail to bound memory
+                        del stderr_chunks[: -1024]
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_drain, name=f"audio-stderr-{sub_id}",
+            daemon=True,
+        ).start()
+        return proc, stderr_chunks
+
+    def resume(self, client, course_id: str, sub_id: str,
+               offset_sec: float) -> AudioHandle | None:
+        """Restart a truncated download from ``offset_sec``.
+
+        Fetches a *fresh* signed URL (the old one may have expired, which
+        is the usual reason a long lecture's stream dies part-way) and
+        spawns a new ffmpeg that seeks to ``offset_sec`` and writes to a
+        new file.  The registered handle is updated in place so
+        ``release()`` cleans up the new process/file; the previous file
+        is deleted here — the caller must have closed it already.
+
+        The resumed process does not take a download slot: it replaces
+        one whose slot was released when it exited, and blocking here on
+        the next lecture's prefetch would stall transcription.
+
+        Returns the updated handle, or None if the lecture was released
+        meanwhile or no URL could be obtained.
+        """
+        sub_id = str(sub_id)
+        with self._lock:
+            handle = self._active.get(sub_id)
+        if not isinstance(handle, AudioHandle):
+            return None
+
+        url = client.get_video_url(course_id, sub_id)
+        if not url:
+            return None
+
+        handle.resumes += 1
+        new_path = os.path.join(
+            self._dir, f"{sub_id}.r{handle.resumes}.raw",
+        )
+        proc, stderr_chunks = self._spawn_ffmpeg(
+            client, url, new_path, sub_id, seek_sec=offset_sec,
+        )
+
+        old_path = handle.path
+        with self._lock:
+            still_ours = self._active.get(sub_id) is handle
+            if still_ours:
+                handle.path = new_path
+                handle.process = proc
+                handle.stderr_chunks = stderr_chunks
+        if not still_ours:
+            proc.kill()
+            proc.wait()
+            if os.path.exists(new_path):
+                os.remove(new_path)
+            return None
+
+        if old_path != new_path and os.path.exists(old_path):
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+        return handle
+
+    def _monitor(self, proc: subprocess.Popen):
+        # Bound to the *original* process: a resumed ffmpeg (see resume())
+        # replaces handle.process but never took a slot of its own.
+        proc.wait()
         self._sem.release()
 
     def get(self, sub_id: str, timeout: float = 120.0) -> AudioHandle | None:
